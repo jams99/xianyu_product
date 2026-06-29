@@ -87,6 +87,25 @@ def init_db() -> None:
                 source_sample_id integer,
                 created_at integer not null
             );
+
+            create table if not exists opportunities (
+                id integer primary key autoincrement,
+                keyword text not null,
+                category text not null default '',
+                cost real not null default 0,
+                min_profit real not null default 3,
+                risk_buffer real not null default 1,
+                sample_prices text not null default '[]',
+                sample_count integer not null default 0,
+                min_price real not null default 0,
+                median_price real not null default 0,
+                suggested_price real not null default 0,
+                max_purchase_price real not null default 0,
+                expected_profit real not null default 0,
+                viable integer not null default 0,
+                decision text not null default '',
+                created_at integer not null
+            );
             """
         )
 
@@ -301,6 +320,33 @@ def parse_price_lines(text: str) -> list[dict[str, Any]]:
     return samples
 
 
+def parse_opportunity_lines(text: str) -> list[dict[str, Any]]:
+    opportunities: list[dict[str, Any]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "|" in line:
+            keyword, price_text = [part.strip() for part in line.split("|", 1)]
+        elif "：" in line:
+            keyword, price_text = [part.strip() for part in line.split("：", 1)]
+        elif ":" in line:
+            keyword, price_text = [part.strip() for part in line.split(":", 1)]
+        else:
+            match = re.search(r"(?:¥|￥)?\s*\d+(?:\.\d{1,2})?\s*(?:元)?", line)
+            if not match:
+                continue
+            keyword = line[: match.start()].strip(" -|，,")
+            price_text = line[match.start() :]
+        prices = [
+            float(match.group(1))
+            for match in re.finditer(r"(?:¥|￥)?\s*(\d+(?:\.\d{1,2})?)\s*(?:元)?", price_text)
+        ]
+        if keyword and prices:
+            opportunities.append({"keyword": keyword[:80], "prices": prices})
+    return opportunities
+
+
 def get_product(conn: sqlite3.Connection, product_id: int) -> dict[str, Any] | None:
     row = conn.execute("select * from products where id = ?", (product_id,)).fetchone()
     return dict(row) if row else None
@@ -312,6 +358,17 @@ def get_samples(conn: sqlite3.Connection, product_id: int) -> list[dict[str, Any
         (product_id,),
     ).fetchall()
     return rows_to_dicts(rows)
+
+
+def get_opportunities(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "select * from opportunities order by viable desc, expected_profit desc, created_at desc limit 30"
+    ).fetchall()
+    opportunities = rows_to_dicts(rows)
+    for opportunity in opportunities:
+        opportunity["viable"] = bool(opportunity["viable"])
+        opportunity["sample_prices"] = json.loads(opportunity["sample_prices"] or "[]")
+    return opportunities
 
 
 def app_state() -> dict[str, Any]:
@@ -342,7 +399,7 @@ def app_state() -> dict[str, Any]:
                     "orders": orders,
                 }
             )
-        return {"products": enriched}
+        return {"products": enriched, "opportunities": get_opportunities(conn)}
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -380,6 +437,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.create_order(payload)
             elif parsed.path == "/api/replies":
                 self.create_reply(payload)
+            elif parsed.path == "/api/opportunities":
+                self.create_opportunities(payload)
+            elif parsed.path == "/api/products/from-opportunity":
+                self.create_product_from_opportunity(payload)
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
         except ValueError as exc:
@@ -677,6 +738,104 @@ class AppHandler(BaseHTTPRequestHandler):
             analysis = analyze_market(product, get_samples(conn, product_id))
         self.send_json({"reply": generate_reply(product, question, analysis)})
 
+    def create_opportunities(self, payload: dict[str, Any]) -> None:
+        text = payload.get("bulk_text", "")
+        category = payload.get("category", "").strip()
+        cost = clean_float(payload.get("cost"), 0)
+        min_profit = clean_float(payload.get("min_profit"), 3)
+        risk_buffer = clean_float(payload.get("risk_buffer"), 1)
+        parsed = parse_opportunity_lines(text)
+        if not parsed:
+            raise ValueError("没有识别到机会数据，请使用“关键词 | 15元 16元 18元”的格式")
+        with connect() as conn:
+            for item in parsed:
+                product = {
+                    "name": item["keyword"],
+                    "category": category,
+                    "keywords": item["keyword"],
+                    "cost": cost,
+                    "min_profit": min_profit,
+                    "risk_buffer": risk_buffer,
+                    "stock_mode": "after_order",
+                    "notes": "",
+                }
+                samples = [
+                    {"title": item["keyword"], "price": price, "note": f"{item['keyword']} {money(price)}元"}
+                    for price in item["prices"]
+                ]
+                analysis = analyze_market(product, samples)
+                conn.execute(
+                    """
+                    insert into opportunities (
+                        keyword, category, cost, min_profit, risk_buffer, sample_prices, sample_count,
+                        min_price, median_price, suggested_price, max_purchase_price,
+                        expected_profit, viable, decision, created_at
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        item["keyword"],
+                        category,
+                        cost,
+                        min_profit,
+                        risk_buffer,
+                        json.dumps(item["prices"], ensure_ascii=False),
+                        len(item["prices"]),
+                        analysis.min_price,
+                        analysis.median_price,
+                        analysis.suggested_price,
+                        analysis.max_purchase_price,
+                        analysis.expected_profit,
+                        1 if analysis.viable else 0,
+                        analysis.decision,
+                        now(),
+                    ),
+                )
+        self.send_json(app_state(), HTTPStatus.CREATED)
+
+    def create_product_from_opportunity(self, payload: dict[str, Any]) -> None:
+        opportunity_id = int(payload.get("opportunity_id", 0))
+        with connect() as conn:
+            row = conn.execute("select * from opportunities where id = ?", (opportunity_id,)).fetchone()
+            if not row:
+                raise ValueError("机会不存在")
+            opportunity = dict(row)
+            cursor = conn.execute(
+                """
+                insert into products (name, category, keywords, cost, min_profit, risk_buffer, stock_mode, notes, created_at)
+                values (?, ?, ?, ?, ?, ?, 'after_order', ?, ?)
+                """,
+                (
+                    opportunity["keyword"],
+                    opportunity["category"],
+                    opportunity["keyword"],
+                    opportunity["cost"],
+                    opportunity["min_profit"],
+                    opportunity["risk_buffer"],
+                    "由机会扫描转入，请发布前确认平台规则和合法来源。",
+                    now(),
+                ),
+            )
+            product_id = cursor.lastrowid
+            prices = json.loads(opportunity["sample_prices"] or "[]")
+            conn.executemany(
+                """
+                insert into market_samples (product_id, title, price, source, seller, note, created_at)
+                values (?, ?, ?, '机会扫描', '', ?, ?)
+                """,
+                [
+                    (
+                        product_id,
+                        opportunity["keyword"],
+                        float(price),
+                        f"机会扫描导入：{opportunity['keyword']} {money(float(price))}元",
+                        now(),
+                    )
+                    for price in prices
+                ],
+            )
+        self.send_json(app_state(), HTTPStatus.CREATED)
+
 
 INDEX_HTML = r"""
 <!doctype html>
@@ -759,6 +918,15 @@ INDEX_HTML = r"""
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
     .product-list { display: grid; gap: 10px; }
+    .compact-list { display: grid; gap: 8px; }
+    .compact-item {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px;
+      background: #fbfcfd;
+    }
+    .compact-item strong { display: block; font-size: 14px; }
+    .compact-item span { color: var(--muted); display: block; font-size: 12px; }
     .product-tab {
       text-align: left;
       color: var(--ink);
@@ -868,6 +1036,30 @@ INDEX_HTML = r"""
       </form>
       <hr>
       <div id="productList" class="product-list"></div>
+      <hr>
+      <h2>机会扫描</h2>
+      <form id="opportunityForm">
+        <label>类目</label>
+        <input name="category" placeholder="虚拟权益、服务">
+        <div class="row">
+          <div>
+            <label>已知成本</label>
+            <input name="cost" type="number" step="0.01" value="0">
+          </div>
+          <div>
+            <label>最低利润</label>
+            <input name="min_profit" type="number" step="0.01" value="3">
+          </div>
+        </div>
+        <label>风险缓冲</label>
+        <input name="risk_buffer" type="number" step="0.01" value="1">
+        <label>关键词与价格</label>
+        <textarea name="bulk_text" placeholder="会员月卡 | 15元 16元 18元 20元&#10;某权益周卡 | 8 9.5 11 12"></textarea>
+        <div class="actions">
+          <button type="submit">扫描机会</button>
+        </div>
+      </form>
+      <div id="opportunityList" class="compact-list"></div>
     </aside>
 
     <div class="workspace" id="workspace">
@@ -918,6 +1110,33 @@ INDEX_HTML = r"""
       list.querySelectorAll("button").forEach((button) => {
         button.addEventListener("click", () => {
           selectedId = Number(button.dataset.id);
+          render();
+        });
+      });
+    }
+
+    function renderOpportunityList() {
+      const list = $("#opportunityList");
+      if (!state.opportunities?.length) {
+        list.innerHTML = '<div class="empty">还没有机会扫描结果</div>';
+        return;
+      }
+      list.innerHTML = state.opportunities.slice(0, 12).map((item) => `
+        <div class="compact-item">
+          <strong>${escapeHtml(item.keyword)}</strong>
+          <span>${item.viable ? "可测试" : "需谨慎"} · 建议 ${money(item.suggested_price)} 元 · 利润 ${money(item.expected_profit)} 元 · 样本 ${item.sample_count}</span>
+          <div class="actions">
+            <button class="good make-product" data-id="${item.id}">转商品</button>
+          </div>
+        </div>
+      `).join("");
+      list.querySelectorAll(".make-product").forEach((button) => {
+        button.addEventListener("click", async () => {
+          state = await api("/api/products/from-opportunity", {
+            method: "POST",
+            body: JSON.stringify({ opportunity_id: Number(button.dataset.id) }),
+          });
+          selectedId = state.products[0]?.id || selectedId;
           render();
         });
       });
@@ -1117,6 +1336,7 @@ INDEX_HTML = r"""
 
     function render() {
       renderProductList();
+      renderOpportunityList();
       renderWorkspace();
     }
 
@@ -1134,6 +1354,11 @@ INDEX_HTML = r"""
       await submitForm(event.currentTarget, "/api/products");
       selectedId = state.products[0]?.id || selectedId;
       render();
+    });
+
+    $("#opportunityForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await submitForm(event.currentTarget, "/api/opportunities");
     });
 
     refresh().catch((error) => {
