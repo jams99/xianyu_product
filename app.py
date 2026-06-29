@@ -361,6 +361,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json(app_state())
         elif parsed.path == "/collector.js":
             self.send_js(self.collector_script(parsed))
+        elif parsed.path == "/publisher.js":
+            self.send_js(self.publisher_script(parsed))
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -466,6 +468,81 @@ class AppHandler(BaseHTTPRequestHandler):
     return;
   }}
   alert(`已导入 ${{priceLines.length}} 条候选价格，请回到本地后台查看。`);
+}})();
+"""
+
+    def publisher_script(self, parsed: urllib.parse.ParseResult) -> str:
+        query = urllib.parse.parse_qs(parsed.query)
+        product_id = int((query.get("product_id") or ["0"])[0])
+        with connect() as conn:
+            product = get_product(conn, product_id)
+            if not product:
+                draft = {"title": "", "price": 0, "body": "商品不存在", "warnings": [], "decision": ""}
+            else:
+                draft = make_publish_draft(product, analyze_market(product, get_samples(conn, product_id)))
+        payload = json.dumps(draft, ensure_ascii=False)
+        return f"""
+(() => {{
+  const draft = {payload};
+  const isVisible = (el) => {{
+    const style = getComputedStyle(el);
+    const box = el.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden" && box.width > 0 && box.height > 0;
+  }};
+  const labelText = (el) => [
+    el.getAttribute("aria-label"),
+    el.getAttribute("placeholder"),
+    el.getAttribute("name"),
+    el.getAttribute("id"),
+    el.closest("label")?.innerText,
+    el.parentElement?.innerText?.slice(0, 120)
+  ].filter(Boolean).join(" ");
+  const setValue = (el, value) => {{
+    el.focus();
+    if (el.isContentEditable) {{
+      el.innerText = value;
+    }} else {{
+      el.value = value;
+    }}
+    el.dispatchEvent(new InputEvent("input", {{ bubbles: true, inputType: "insertText", data: String(value).slice(0, 20) }}));
+    el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+    el.blur();
+  }};
+  const fields = Array.from(document.querySelectorAll("input, textarea, [contenteditable='true'], [contenteditable='plaintext-only']"))
+    .filter((el) => !el.disabled && !el.readOnly && isVisible(el));
+  const pick = (patterns, fallback) => {{
+    const scored = fields
+      .map((el) => {{
+        const text = labelText(el);
+        const score = patterns.reduce((sum, pattern) => sum + (pattern.test(text) ? 1 : 0), 0);
+        return {{ el, score }};
+      }})
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+    return scored[0]?.el || fallback();
+  }};
+  const textInputs = fields.filter((el) => el.tagName === "INPUT" && !["hidden", "file", "checkbox", "radio"].includes((el.type || "").toLowerCase()));
+  const titleField = pick([/标题|名称|宝贝|商品|闲置/], () => textInputs[0]);
+  const priceField = pick([/价格|售价|金额|价钱/], () => textInputs.find((el) => ["number", "tel", "text"].includes((el.type || "text").toLowerCase())));
+  const bodyField = pick([/描述|详情|介绍|说明|内容/], () => fields.find((el) => el.tagName === "TEXTAREA" || el.isContentEditable));
+  const filled = [];
+  if (titleField) {{
+    setValue(titleField, draft.title);
+    filled.push("标题");
+  }}
+  if (priceField) {{
+    setValue(priceField, String(draft.price));
+    filled.push("价格");
+  }}
+  if (bodyField) {{
+    setValue(bodyField, draft.body);
+    filled.push("描述");
+  }}
+  alert(
+    filled.length
+      ? `已尝试填入：${{filled.join("、")}}。请人工检查类目、图片、规则提示和最终发布按钮。`
+      : "没有找到可填写的标题/价格/描述输入框，请确认已进入发布编辑页。"
+  );
 }})();
 """
 
@@ -909,7 +986,10 @@ INDEX_HTML = r"""
             <pre>${escapeHtml(draft.body)}</pre>
             <div class="actions">
               <button id="saveDraft" class="good">保存草稿</button>
+              <button id="copyPublisher" class="secondary">复制填表脚本</button>
+              <a class="search-link" href="https://www.goofish.com" target="_blank">打开闲鱼</a>
             </div>
+            <p class="helper-text">进入发布编辑页后运行填表脚本；脚本只填内容，不点击发布。</p>
           </section>
         </div>
 
@@ -1000,6 +1080,11 @@ INDEX_HTML = r"""
       $("#saveDraft").addEventListener("click", async () => {
         await api("/api/drafts", { method: "POST", body: JSON.stringify({ product_id: productId }) });
         await refresh();
+      });
+      $("#copyPublisher").addEventListener("click", async () => {
+        const script = `javascript:(()=>{fetch("http://127.0.0.1:8765/publisher.js?product_id=${productId}").then(r=>r.text()).then(code=>eval(code));})()`;
+        await navigator.clipboard.writeText(script);
+        alert("填表脚本已复制。进入闲鱼发布编辑页后，把它粘贴到地址栏或保存成书签运行。");
       });
       $("#replyForm").addEventListener("submit", async (event) => {
         event.preventDefault();
