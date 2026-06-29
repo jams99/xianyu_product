@@ -991,7 +991,7 @@ INDEX_HTML = r"""
     header p { margin: 4px 0 0; color: var(--muted); font-size: 14px; }
     main {
       display: grid;
-      grid-template-columns: 360px 1fr;
+      grid-template-columns: 320px 1fr;
       gap: 18px;
       padding: 18px;
       max-width: 1440px;
@@ -1030,33 +1030,7 @@ INDEX_HTML = r"""
     button:disabled { opacity: .6; cursor: wait; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-    .product-list { display: grid; gap: 10px; }
-    .product-tab {
-      text-align: left;
-      color: var(--ink);
-      background: #fff;
-      border: 1px solid var(--line);
-      display: block;
-      width: 100%;
-    }
-    .product-tab.active { border-color: var(--accent); background: var(--soft); }
-    .product-tab strong { display: block; font-size: 15px; }
-    .product-tab span { color: var(--muted); font-size: 13px; }
     .workspace { display: grid; gap: 18px; }
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(5, minmax(120px, 1fr));
-      gap: 10px;
-    }
-    .metric {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 10px;
-      min-height: 74px;
-      background: #fbfcfd;
-    }
-    .metric span { display: block; color: var(--muted); font-size: 12px; }
-    .metric strong { display: block; margin-top: 5px; font-size: 20px; }
     .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
     .badge {
       display: inline-flex;
@@ -1096,7 +1070,6 @@ INDEX_HTML = r"""
     .helper-text { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
     @media (max-width: 980px) {
       main, .grid2 { grid-template-columns: 1fr; }
-      .metrics { grid-template-columns: repeat(2, 1fr); }
     }
   </style>
 </head>
@@ -1123,13 +1096,9 @@ INDEX_HTML = r"""
         <input name="risk_buffer" type="number" step="0.01" value="1">
         <div class="actions">
           <button type="submit" class="good">自动选品入队</button>
-          <button type="button" id="cleanupLabor" class="secondary">清理服务类候选</button>
         </div>
         <p class="helper-text">系统会从无需人力服务的数字权益候选池里选择商品，生成草稿并加入发布队列。</p>
       </form>
-      <hr>
-      <h2>已规划商品</h2>
-      <div id="productList" class="product-list"></div>
     </aside>
 
     <div class="workspace" id="workspace">
@@ -1157,6 +1126,8 @@ INDEX_HTML = r"""
 
     async function refresh() {
       state = await api("/api/state");
+      const activeQueueItem = state.publish_queue?.find((item) => item.status === "active");
+      if (activeQueueItem) selectedId = activeQueueItem.product_id;
       if (!selectedId && state.products.length) selectedId = state.products[0].id;
       if (selectedId && !state.products.some((p) => p.id === selectedId)) selectedId = state.products[0]?.id || null;
       render();
@@ -1164,26 +1135,6 @@ INDEX_HTML = r"""
 
     function selectedProduct() {
       return state.products.find((product) => product.id === selectedId);
-    }
-
-    function renderProductList() {
-      const list = $("#productList");
-      if (!state.products.length) {
-        list.innerHTML = '<div class="empty">还没有商品</div>';
-        return;
-      }
-      list.innerHTML = state.products.map((product) => `
-        <button class="product-tab ${product.id === selectedId ? "active" : ""}" data-id="${product.id}">
-          <strong>${escapeHtml(product.name)}</strong>
-          <span>${escapeHtml(product.category || "未分类")} · 建议价 ${money(product.analysis.suggested_price)} 元</span>
-        </button>
-      `).join("");
-      list.querySelectorAll("button").forEach((button) => {
-        button.addEventListener("click", () => {
-          selectedId = Number(button.dataset.id);
-          render();
-        });
-      });
     }
 
     function renderWorkspace() {
@@ -1196,67 +1147,27 @@ INDEX_HTML = r"""
       }
       const a = product.analysis;
       const draft = product.draft_preview;
-      const query = encodeURIComponent(product.keywords || product.name);
       workspace.innerHTML = `
         ${queueHtml}
         <section>
-          <h2>${escapeHtml(product.name)}</h2>
+          <h2>当前商品</h2>
           <p>
+            <strong>${escapeHtml(product.name)}</strong>
             <span class="badge ${a.viable ? "" : "warn"}">${a.viable ? "可测试" : "需谨慎"}</span>
-            <span class="badge">样本 ${a.sample_count}</span>
-            <a class="search-link" href="https://www.goofish.com/search?q=${query}" target="_blank">打开闲鱼搜索</a>
+            <span class="badge">建议价 ${money(a.suggested_price)} 元</span>
           </p>
-          <div class="actions">
-            <button id="copyCollector" class="secondary">复制采样脚本</button>
-          </div>
-          <p class="helper-text">先打开搜索页，等结果加载后运行采样脚本；脚本只读取当前页面文字并导入价格样本。</p>
-          <div class="metrics">
-            ${metric("最低价", a.min_price)}
-            ${metric("低价区间", a.q1_price)}
-            ${metric("中位数", a.median_price)}
-            ${metric("去极值均价", a.trimmed_avg)}
-            ${metric("建议售价", a.suggested_price)}
-          </div>
-          <p><strong>决策：</strong>${escapeHtml(a.decision)}</p>
-          <p><strong>采购上限：</strong>${money(a.max_purchase_price)} 元；<strong>预估利润：</strong>${money(a.expected_profit)} 元；<strong>加价策略：</strong>主流价 + ${money(a.recommended_markup)} 元。</p>
+          <p><strong>采购上限：</strong>${money(a.max_purchase_price)} 元；<strong>预估利润：</strong>${money(a.expected_profit)} 元。</p>
           ${draft.warnings.map((warning) => `<div class="notice">${escapeHtml(warning)}</div>`).join("")}
-        </section>
-
-        <div class="grid2">
-          <section>
-            <h3>录入行情</h3>
-            <form id="sampleForm">
-              <label>批量粘贴搜索结果</label>
-              <textarea name="bulk_text" placeholder="例：某会员月卡 18元 有效期30天&#10;同类商品 ￥16.5 秒发"></textarea>
-              <div class="row">
-                <div>
-                  <label>单条标题</label>
-                  <input name="title" placeholder="可选">
-                </div>
-                <div>
-                  <label>单条价格</label>
-                  <input name="price" type="number" step="0.01" placeholder="可选">
-                </div>
-              </div>
-              <div class="actions">
-                <button type="submit">保存行情</button>
-              </div>
-            </form>
-          </section>
-
-          <section>
+          <div>
             <h3>发布草稿</h3>
             <p><strong>标题：</strong>${escapeHtml(draft.title)}</p>
             <p><strong>价格：</strong>${money(draft.price)} 元</p>
             <pre>${escapeHtml(draft.body)}</pre>
             <div class="actions">
-              <button id="saveDraft" class="good">保存草稿</button>
               <button id="copyPublisher" class="secondary">复制填表脚本</button>
-              <a class="search-link" href="https://www.goofish.com" target="_blank">打开闲鱼</a>
             </div>
-            <p class="helper-text">进入发布编辑页后运行填表脚本；脚本只填内容，不点击发布。</p>
-          </section>
-        </div>
+          </div>
+        </section>
 
         <div class="grid2">
           <section>
@@ -1287,51 +1198,8 @@ INDEX_HTML = r"""
             <p class="notice">系统会优先使用最新粘贴的货源，并结合历史样本排序；如果没有价格低于采购上限的候选货源，会生成缺货处理建议。</p>
           </section>
         </div>
-
-        <section>
-          <h3>行情样本</h3>
-          ${renderSamples(product.samples)}
-        </section>
-
-        <section>
-          <h3>订单记录</h3>
-          ${renderOrders(product.orders)}
-        </section>
       `;
       bindWorkspaceForms(product.id);
-    }
-
-    function metric(label, value) {
-      return `<div class="metric"><span>${label}</span><strong>${money(value)} 元</strong></div>`;
-    }
-
-    function renderSamples(samples) {
-      if (!samples.length) return '<div class="empty">还没有行情样本</div>';
-      return `
-        <table>
-          <thead><tr><th>价格</th><th>标题</th><th>备注</th></tr></thead>
-          <tbody>${samples.map((sample) => `
-            <tr><td>${money(sample.price)} 元</td><td>${escapeHtml(sample.title)}</td><td>${escapeHtml(sample.note || "")}</td></tr>
-          `).join("")}</tbody>
-        </table>
-      `;
-    }
-
-    function renderOrders(orders) {
-      if (!orders.length) return '<div class="empty">还没有订单</div>';
-      return `
-        <table>
-          <thead><tr><th>状态</th><th>成交价</th><th>采购上限</th><th>处理建议</th></tr></thead>
-          <tbody>${orders.map((order) => `
-            <tr>
-              <td><span class="badge ${order.status === "out_of_stock" ? "bad" : ""}">${escapeHtml(order.status)}</span></td>
-              <td>${money(order.sale_price)} 元</td>
-              <td>${money(order.max_purchase_price)} 元</td>
-              <td>${escapeHtml(order.reply)}</td>
-            </tr>
-          `).join("")}</tbody>
-        </table>
-      `;
     }
 
     function renderPublishQueue(queue) {
@@ -1376,19 +1244,6 @@ INDEX_HTML = r"""
     }
 
     function bindWorkspaceForms(productId) {
-      $("#sampleForm").addEventListener("submit", async (event) => {
-        event.preventDefault();
-        await submitForm(event.currentTarget, "/api/market-samples", { product_id: productId });
-      });
-      $("#copyCollector").addEventListener("click", async () => {
-        const script = `javascript:(()=>{fetch("http://127.0.0.1:8765/collector.js?product_id=${productId}").then(r=>r.text()).then(code=>eval(code));})()`;
-        await navigator.clipboard.writeText(script);
-        alert("采样脚本已复制。打开闲鱼搜索页后，把它粘贴到地址栏或保存成书签运行。");
-      });
-      $("#saveDraft").addEventListener("click", async () => {
-        await api("/api/drafts", { method: "POST", body: JSON.stringify({ product_id: productId }) });
-        await refresh();
-      });
       $("#copyPublisher").addEventListener("click", async () => {
         await navigator.clipboard.writeText(publisherBookmarklet(productId));
         alert("填表脚本已复制。进入闲鱼发布编辑页后，把它粘贴到地址栏或保存成书签运行。");
@@ -1423,7 +1278,6 @@ INDEX_HTML = r"""
     }
 
     function render() {
-      renderProductList();
       renderWorkspace();
       bindQueueActions();
     }
@@ -1442,13 +1296,6 @@ INDEX_HTML = r"""
       await submitForm(event.currentTarget, "/api/autopilot/run");
       selectedId = state.products[0]?.id || selectedId;
       render();
-    });
-
-    $("#cleanupLabor").addEventListener("click", async () => {
-      state = await api("/api/autopilot/cleanup-labor", { method: "POST", body: "{}" });
-      selectedId = state.products[0]?.id || null;
-      render();
-      alert(`已清理 ${state.removed || 0} 个服务类候选。`);
     });
 
     function bindQueueActions() {
