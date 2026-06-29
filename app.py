@@ -536,9 +536,7 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         try:
             payload = self.read_json()
-            if parsed.path == "/api/products":
-                self.create_product(payload)
-            elif parsed.path == "/api/market-samples":
+            if parsed.path == "/api/market-samples":
                 self.create_market_samples(payload)
             elif parsed.path == "/api/drafts":
                 self.create_draft(payload)
@@ -721,30 +719,6 @@ class AppHandler(BaseHTTPRequestHandler):
   );
 }})();
 """
-
-    def create_product(self, payload: dict[str, Any]) -> None:
-        name = payload.get("name", "").strip()
-        if not name:
-            raise ValueError("商品名称不能为空")
-        with connect() as conn:
-            conn.execute(
-                """
-                insert into products (name, category, keywords, cost, min_profit, risk_buffer, stock_mode, notes, created_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    name,
-                    payload.get("category", "").strip(),
-                    payload.get("keywords", "").strip(),
-                    clean_float(payload.get("cost"), 0),
-                    clean_float(payload.get("min_profit"), 3),
-                    clean_float(payload.get("risk_buffer"), 1),
-                    payload.get("stock_mode", "after_order"),
-                    payload.get("notes", "").strip(),
-                    now(),
-                ),
-            )
-        self.send_json(app_state(), HTTPStatus.CREATED)
 
     def create_market_samples(self, payload: dict[str, Any]) -> None:
         product_id = int(payload.get("product_id", 0))
@@ -1284,40 +1258,6 @@ INDEX_HTML = r"""
   </header>
   <main>
     <aside class="panel">
-      <h2>商品池</h2>
-      <form id="productForm">
-        <label>商品名称</label>
-        <input name="name" placeholder="例：某会员月卡 / 电影通兑票">
-        <label>类目</label>
-        <input name="category" placeholder="虚拟权益、卡券、服务">
-        <label>搜索关键词</label>
-        <input name="keywords" placeholder="多个关键词用空格或逗号分隔">
-        <div class="row">
-          <div>
-            <label>已知成本</label>
-            <input name="cost" type="number" step="0.01" value="0">
-          </div>
-          <div>
-            <label>最低利润</label>
-            <input name="min_profit" type="number" step="0.01" value="3">
-          </div>
-        </div>
-        <label>风险缓冲</label>
-        <input name="risk_buffer" type="number" step="0.01" value="1">
-        <label>库存模式</label>
-        <select name="stock_mode">
-          <option value="after_order">接单后采购</option>
-          <option value="in_stock">已有库存</option>
-        </select>
-        <label>备注</label>
-        <textarea name="notes" placeholder="使用范围、限制、售后规则"></textarea>
-        <div class="actions">
-          <button type="submit">添加商品</button>
-        </div>
-      </form>
-      <hr>
-      <div id="productList" class="product-list"></div>
-      <hr>
       <h2>后台自动选品</h2>
       <form id="autopilotForm">
         <div class="row">
@@ -1338,6 +1278,9 @@ INDEX_HTML = r"""
         </div>
         <p class="helper-text">系统会从无需人力服务的数字权益候选池里选择商品，生成草稿并加入发布队列。</p>
       </form>
+      <hr>
+      <h2>已规划商品</h2>
+      <div id="productList" class="product-list"></div>
       <hr>
       <h2>机会扫描</h2>
       <form id="opportunityForm">
@@ -1449,7 +1392,7 @@ INDEX_HTML = r"""
       const workspace = $("#workspace");
       const queueHtml = renderPublishQueue(state.publish_queue || []);
       if (!product) {
-        workspace.innerHTML = `${queueHtml}<section class="empty">可以先运行后台自动选品，或手动添加一个商品。</section>`;
+        workspace.innerHTML = `${queueHtml}<section class="empty">先运行后台自动选品，或从机会扫描转入商品。</section>`;
         return;
       }
       const a = product.analysis;
@@ -1686,13 +1629,6 @@ INDEX_HTML = r"""
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
     }
-
-    $("#productForm").addEventListener("submit", async (event) => {
-      event.preventDefault();
-      await submitForm(event.currentTarget, "/api/products");
-      selectedId = state.products[0]?.id || selectedId;
-      render();
-    });
 
     $("#opportunityForm").addEventListener("submit", async (event) => {
       event.preventDefault();
