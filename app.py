@@ -696,10 +696,28 @@ class AppHandler(BaseHTTPRequestHandler):
         product_id = int(payload.get("product_id", 0))
         sale_price = clean_float(payload.get("sale_price"), 0)
         buyer = payload.get("buyer", "").strip()
+        fresh_sources = parse_price_lines(payload.get("fresh_sources", ""))
         with connect() as conn:
             product = get_product(conn, product_id)
             if not product:
                 raise ValueError("商品不存在")
+            if fresh_sources:
+                conn.executemany(
+                    """
+                    insert into market_samples (product_id, title, price, source, seller, note, created_at)
+                    values (?, ?, ?, '履约搜索', '', ?, ?)
+                    """,
+                    [
+                        (
+                            product_id,
+                            sample["title"],
+                            sample["price"],
+                            sample.get("note", ""),
+                            now(),
+                        )
+                        for sample in fresh_sources
+                    ],
+                )
             samples = get_samples(conn, product_id)
             analysis = analyze_market(product, samples)
             if sale_price <= 0:
@@ -709,14 +727,22 @@ class AppHandler(BaseHTTPRequestHandler):
             candidates.sort(key=lambda item: float(item["price"]))
             if candidates:
                 chosen = candidates[0]
+                ranked = "；".join(
+                    f"{index + 1}. {item['title']} {money(float(item['price']))}元"
+                    for index, item in enumerate(candidates[:5])
+                )
                 reply = (
                     f"这单可以处理。最高采购价 {money(max_purchase)} 元，"
-                    f"优先找：{chosen['title']}（{money(float(chosen['price']))} 元）。人工付款确认后再交付。"
+                    f"优先找：{chosen['title']}（{money(float(chosen['price']))} 元）。"
+                    f"候选排序：{ranked}。人工付款确认后再交付。"
                 )
                 status = "source_found"
                 source_id = chosen["id"]
             else:
-                reply = f"抱歉，当前没有找到合适货源，暂时缺货。建议不要让买家付款或及时协商取消。"
+                reply = (
+                    f"抱歉，当前没有找到低于 {money(max_purchase)} 元采购上限的合适货源，暂时缺货。"
+                    "建议不要让买家付款或及时协商取消。"
+                )
                 status = "out_of_stock"
                 source_id = None
             conn.execute(
@@ -1232,11 +1258,13 @@ INDEX_HTML = r"""
               <input name="buyer" placeholder="昵称或订单备注">
               <label>成交价</label>
               <input name="sale_price" type="number" step="0.01" value="${a.suggested_price}">
+              <label>最新低价货源</label>
+              <textarea name="fresh_sources" placeholder="接单后重新搜索，把候选低价结果粘贴到这里。例：低价月卡 15元 可用"></textarea>
               <div class="actions">
                 <button type="submit">判断货源</button>
               </div>
             </form>
-            <p class="notice">如果没有价格低于采购上限的候选货源，系统会生成缺货处理建议。</p>
+            <p class="notice">系统会优先使用最新粘贴的货源，并结合历史样本排序；如果没有价格低于采购上限的候选货源，会生成缺货处理建议。</p>
           </section>
         </div>
 
