@@ -1,0 +1,993 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import math
+import re
+import sqlite3
+import statistics
+import time
+import urllib.parse
+from dataclasses import dataclass
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DB_PATH = ROOT / "xianyu_agent.db"
+HOST = "127.0.0.1"
+PORT = 8765
+
+
+RISK_KEYWORDS = {
+    "电影票": "票务/卡券类商品可能存在平台类目和资质要求，发布前请确认规则与合法来源。",
+    "演唱会": "演出票务风险较高，建议不要发布来源不确定或平台限制的商品。",
+    "充值卡": "电子卡券类商品可能需要走指定频道或受类目限制，发布前请确认规则。",
+    "卡密": "卡密交付要保留来源、有效期和售后说明，避免承诺无法兑现。",
+    "优惠券": "优惠券需确认可转让、可使用、未违反发行方规则。",
+}
+
+
+def connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with connect() as conn:
+        conn.executescript(
+            """
+            create table if not exists products (
+                id integer primary key autoincrement,
+                name text not null,
+                category text not null default '',
+                keywords text not null default '',
+                cost real not null default 0,
+                min_profit real not null default 3,
+                risk_buffer real not null default 1,
+                stock_mode text not null default 'after_order',
+                status text not null default 'active',
+                notes text not null default '',
+                created_at integer not null
+            );
+
+            create table if not exists market_samples (
+                id integer primary key autoincrement,
+                product_id integer not null references products(id) on delete cascade,
+                title text not null,
+                price real not null,
+                source text not null default '闲鱼',
+                seller text not null default '',
+                note text not null default '',
+                created_at integer not null
+            );
+
+            create table if not exists drafts (
+                id integer primary key autoincrement,
+                product_id integer not null references products(id) on delete cascade,
+                title text not null,
+                price real not null,
+                body text not null,
+                warnings text not null default '[]',
+                decision text not null default '',
+                created_at integer not null
+            );
+
+            create table if not exists orders (
+                id integer primary key autoincrement,
+                product_id integer not null references products(id),
+                buyer text not null default '',
+                sale_price real not null,
+                max_purchase_price real not null,
+                status text not null default 'new',
+                reply text not null default '',
+                source_sample_id integer,
+                created_at integer not null
+            );
+            """
+        )
+
+
+def now() -> int:
+    return int(time.time())
+
+
+def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    return [dict(row) for row in rows]
+
+
+def money(value: float) -> str:
+    rounded = round(value + 1e-9, 2)
+    if rounded == int(rounded):
+        return str(int(rounded))
+    return f"{rounded:.2f}".rstrip("0").rstrip(".")
+
+
+def clean_float(value: Any, default: float = 0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * pct
+    lower = math.floor(pos)
+    upper = math.ceil(pos)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] * (upper - pos) + ordered[upper] * (pos - lower)
+
+
+def trimmed_mean(values: list[float]) -> float:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    if len(ordered) >= 5:
+        cut = max(1, int(len(ordered) * 0.1))
+        ordered = ordered[cut:-cut] or ordered
+    return statistics.fmean(ordered)
+
+
+def risk_warnings(product: dict[str, Any]) -> list[str]:
+    text = f"{product.get('name', '')} {product.get('category', '')} {product.get('keywords', '')} {product.get('notes', '')}"
+    warnings: list[str] = []
+    for keyword, warning in RISK_KEYWORDS.items():
+        if keyword in text:
+            warnings.append(warning)
+    if product.get("stock_mode") == "after_order":
+        warnings.append("当前是接单后采购模式，发布文案不要承诺现货秒发；建议写清楚确认后安排。")
+    return warnings
+
+
+@dataclass
+class MarketAnalysis:
+    sample_count: int
+    min_price: float
+    q1_price: float
+    median_price: float
+    trimmed_avg: float
+    high_price: float
+    recommended_markup: float
+    suggested_price: float
+    estimated_purchase_price: float
+    max_purchase_price: float
+    expected_profit: float
+    viable: bool
+    decision: str
+
+
+def analyze_market(product: dict[str, Any], samples: list[dict[str, Any]]) -> MarketAnalysis:
+    prices = [float(sample["price"]) for sample in samples if float(sample["price"]) > 0]
+    min_profit = float(product["min_profit"])
+    risk_buffer = float(product["risk_buffer"])
+    cost = float(product["cost"])
+
+    if not prices:
+        floor = cost + min_profit + risk_buffer
+        return MarketAnalysis(
+            sample_count=0,
+            min_price=0,
+            q1_price=0,
+            median_price=0,
+            trimmed_avg=0,
+            high_price=0,
+            recommended_markup=2,
+            suggested_price=math.ceil(floor),
+            estimated_purchase_price=cost,
+            max_purchase_price=0,
+            expected_profit=0,
+            viable=False,
+            decision="先补充至少 5 条闲鱼行情样本，再发布测试。",
+        )
+
+    min_price = min(prices)
+    q1_price = percentile(prices, 0.25)
+    median_price = statistics.median(prices)
+    avg = trimmed_mean(prices)
+    high_price = percentile(prices, 0.75)
+    spread = max(high_price - min_price, 0)
+    competition = len(prices)
+
+    if competition < 5:
+        markup = 1
+    elif spread >= 8:
+        markup = 2
+    else:
+        markup = 1.5
+
+    estimated_purchase = max(cost, min_price)
+    floor_price = estimated_purchase + min_profit + risk_buffer
+    market_anchor = max(median_price, avg) + markup
+    suggested = math.ceil(max(floor_price, market_anchor))
+    max_purchase = suggested - min_profit - risk_buffer
+    expected_profit = suggested - estimated_purchase - risk_buffer
+    viable = max_purchase >= estimated_purchase and expected_profit >= min_profit
+
+    if len(prices) < 5:
+        decision = "样本偏少，可以小量测试；建议先观察 5 条以上同类商品。"
+    elif not viable:
+        decision = "暂不建议发布：低价货源和目标利润之间空间不足。"
+    elif suggested > median_price + 5 and spread < 5:
+        decision = "可测试但要谨慎：建议价明显高于主流价，优先优化文案和信任感。"
+    else:
+        decision = "可以发布测试：价差空间满足最低利润和风险缓冲。"
+
+    return MarketAnalysis(
+        sample_count=len(prices),
+        min_price=min_price,
+        q1_price=q1_price,
+        median_price=median_price,
+        trimmed_avg=avg,
+        high_price=high_price,
+        recommended_markup=markup,
+        suggested_price=suggested,
+        estimated_purchase_price=estimated_purchase,
+        max_purchase_price=max_purchase,
+        expected_profit=expected_profit,
+        viable=viable,
+        decision=decision,
+    )
+
+
+def make_publish_draft(product: dict[str, Any], analysis: MarketAnalysis) -> dict[str, Any]:
+    name = product["name"].strip()
+    keywords = [part.strip() for part in re.split(r"[,，\s]+", product["keywords"]) if part.strip()]
+    suffix = " ".join(keywords[:3])
+    title = f"{name} {suffix} 可确认后安排".strip()
+    if len(title) > 30:
+        title = title[:30]
+
+    body_lines = [
+        f"商品：{name}",
+        "适合不需要快递的虚拟权益/服务类需求。",
+        "下单前请先咨询，确认可用范围、有效期和当前可安排情况。",
+        "确认后再安排采购与交付；如暂时没有合适货源，会及时说明缺货并不强行成交。",
+        "不支持来源不明、违规用途或超出规则范围的使用方式。",
+    ]
+    if product["notes"].strip():
+        body_lines.append(f"补充说明：{product['notes'].strip()}")
+    body_lines.append(f"参考售价：{money(analysis.suggested_price)} 元")
+
+    warnings = risk_warnings(product)
+    return {
+        "title": title,
+        "price": analysis.suggested_price,
+        "body": "\n".join(body_lines),
+        "warnings": warnings,
+        "decision": analysis.decision,
+    }
+
+
+def generate_reply(product: dict[str, Any], question: str, analysis: MarketAnalysis | None = None) -> str:
+    q = question.strip()
+    name = product["name"]
+    lower = q.lower()
+
+    if any(word in q for word in ["便宜", "优惠", "少点", "刀", "最低"]):
+        price = money(analysis.suggested_price) if analysis else "当前标价"
+        return f"可以先按 {price} 元看，确认可用范围后我再帮你安排。这个价格已经预留了采购和售后风险，不太适合大幅议价。"
+    if any(word in q for word in ["有货", "现在", "多久", "发货", "什么时候"]):
+        return f"{name} 需要先确认当前低价货源和可用范围。你把使用场景/地区/面额发我，我确认能安排再让你下单；如果没有合适货源会直接说缺货。"
+    if any(word in q for word in ["怎么用", "使用", "有效期", "范围"]):
+        return f"{name} 的使用范围、有效期和限制需要按具体货源确认。你先说下要用在哪里，我确认后给你完整说明，避免买错。"
+    if any(word in lower for word in ["hi", "hello"]) or "你好" in q:
+        return f"你好，{name} 下单前需要先确认可用范围和当前货源。你可以把需求发我，我确认能安排再继续。"
+    return f"收到，我先按 {name} 帮你确认。为了避免无效交付，请补充一下使用范围、期望价格和是否急用；如果没有合适低价货源，我会直接回复缺货。"
+
+
+def parse_price_lines(text: str) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.search(r"(?:¥|￥)?\s*(\d+(?:\.\d{1,2})?)\s*(?:元)?", line)
+        if not match:
+            continue
+        price = float(match.group(1))
+        title = (line[: match.start()] + line[match.end() :]).strip(" -|，,")
+        if not title:
+            title = line
+        samples.append({"title": title[:120], "price": price, "note": line[:240]})
+    return samples
+
+
+def get_product(conn: sqlite3.Connection, product_id: int) -> dict[str, Any] | None:
+    row = conn.execute("select * from products where id = ?", (product_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_samples(conn: sqlite3.Connection, product_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "select * from market_samples where product_id = ? order by price asc, created_at desc",
+        (product_id,),
+    ).fetchall()
+    return rows_to_dicts(rows)
+
+
+def app_state() -> dict[str, Any]:
+    with connect() as conn:
+        products = rows_to_dicts(conn.execute("select * from products order by created_at desc").fetchall())
+        enriched: list[dict[str, Any]] = []
+        for product in products:
+            samples = get_samples(conn, product["id"])
+            analysis = analyze_market(product, samples)
+            draft = make_publish_draft(product, analysis)
+            latest_draft = conn.execute(
+                "select * from drafts where product_id = ? order by created_at desc limit 1",
+                (product["id"],),
+            ).fetchone()
+            orders = rows_to_dicts(
+                conn.execute(
+                    "select * from orders where product_id = ? order by created_at desc",
+                    (product["id"],),
+                ).fetchall()
+            )
+            enriched.append(
+                {
+                    **product,
+                    "samples": samples,
+                    "analysis": analysis.__dict__,
+                    "draft_preview": draft,
+                    "latest_draft": dict(latest_draft) if latest_draft else None,
+                    "orders": orders,
+                }
+            )
+        return {"products": enriched}
+
+
+class AppHandler(BaseHTTPRequestHandler):
+    server_version = "XianyuAgent/0.1"
+
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/":
+            self.send_html(INDEX_HTML)
+        elif parsed.path == "/api/state":
+            self.send_json(app_state())
+        else:
+            self.send_error(HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        try:
+            payload = self.read_json()
+            if parsed.path == "/api/products":
+                self.create_product(payload)
+            elif parsed.path == "/api/market-samples":
+                self.create_market_samples(payload)
+            elif parsed.path == "/api/drafts":
+                self.create_draft(payload)
+            elif parsed.path == "/api/orders":
+                self.create_order(payload)
+            elif parsed.path == "/api/replies":
+                self.create_reply(payload)
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except Exception as exc:
+            self.send_json({"error": f"服务器错误：{exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get("content-length", "0"))
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        return json.loads(raw.decode("utf-8"))
+
+    def send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
+        encoded = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json; charset=utf-8")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def send_html(self, html: str) -> None:
+        encoded = html.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def create_product(self, payload: dict[str, Any]) -> None:
+        name = payload.get("name", "").strip()
+        if not name:
+            raise ValueError("商品名称不能为空")
+        with connect() as conn:
+            conn.execute(
+                """
+                insert into products (name, category, keywords, cost, min_profit, risk_buffer, stock_mode, notes, created_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    name,
+                    payload.get("category", "").strip(),
+                    payload.get("keywords", "").strip(),
+                    clean_float(payload.get("cost"), 0),
+                    clean_float(payload.get("min_profit"), 3),
+                    clean_float(payload.get("risk_buffer"), 1),
+                    payload.get("stock_mode", "after_order"),
+                    payload.get("notes", "").strip(),
+                    now(),
+                ),
+            )
+        self.send_json(app_state(), HTTPStatus.CREATED)
+
+    def create_market_samples(self, payload: dict[str, Any]) -> None:
+        product_id = int(payload.get("product_id", 0))
+        text = payload.get("bulk_text", "")
+        manual_title = payload.get("title", "").strip()
+        manual_price = clean_float(payload.get("price"), 0)
+        source = payload.get("source", "闲鱼").strip() or "闲鱼"
+        with connect() as conn:
+            product = get_product(conn, product_id)
+            if not product:
+                raise ValueError("商品不存在")
+            samples = parse_price_lines(text)
+            if manual_title and manual_price > 0:
+                samples.append({"title": manual_title, "price": manual_price, "note": payload.get("note", "").strip()})
+            if not samples:
+                raise ValueError("没有识别到有效价格")
+            conn.executemany(
+                """
+                insert into market_samples (product_id, title, price, source, seller, note, created_at)
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        product_id,
+                        sample["title"],
+                        sample["price"],
+                        source,
+                        payload.get("seller", "").strip(),
+                        sample.get("note", ""),
+                        now(),
+                    )
+                    for sample in samples
+                ],
+            )
+        self.send_json(app_state(), HTTPStatus.CREATED)
+
+    def create_draft(self, payload: dict[str, Any]) -> None:
+        product_id = int(payload.get("product_id", 0))
+        with connect() as conn:
+            product = get_product(conn, product_id)
+            if not product:
+                raise ValueError("商品不存在")
+            samples = get_samples(conn, product_id)
+            analysis = analyze_market(product, samples)
+            draft = make_publish_draft(product, analysis)
+            conn.execute(
+                """
+                insert into drafts (product_id, title, price, body, warnings, decision, created_at)
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    product_id,
+                    draft["title"],
+                    draft["price"],
+                    draft["body"],
+                    json.dumps(draft["warnings"], ensure_ascii=False),
+                    draft["decision"],
+                    now(),
+                ),
+            )
+        self.send_json(app_state(), HTTPStatus.CREATED)
+
+    def create_order(self, payload: dict[str, Any]) -> None:
+        product_id = int(payload.get("product_id", 0))
+        sale_price = clean_float(payload.get("sale_price"), 0)
+        buyer = payload.get("buyer", "").strip()
+        with connect() as conn:
+            product = get_product(conn, product_id)
+            if not product:
+                raise ValueError("商品不存在")
+            samples = get_samples(conn, product_id)
+            analysis = analyze_market(product, samples)
+            if sale_price <= 0:
+                sale_price = analysis.suggested_price
+            max_purchase = sale_price - float(product["min_profit"]) - float(product["risk_buffer"])
+            candidates = [sample for sample in samples if float(sample["price"]) <= max_purchase]
+            candidates.sort(key=lambda item: float(item["price"]))
+            if candidates:
+                chosen = candidates[0]
+                reply = (
+                    f"这单可以处理。最高采购价 {money(max_purchase)} 元，"
+                    f"优先找：{chosen['title']}（{money(float(chosen['price']))} 元）。人工付款确认后再交付。"
+                )
+                status = "source_found"
+                source_id = chosen["id"]
+            else:
+                reply = f"抱歉，当前没有找到合适货源，暂时缺货。建议不要让买家付款或及时协商取消。"
+                status = "out_of_stock"
+                source_id = None
+            conn.execute(
+                """
+                insert into orders (product_id, buyer, sale_price, max_purchase_price, status, reply, source_sample_id, created_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (product_id, buyer, sale_price, max_purchase, status, reply, source_id, now()),
+            )
+        self.send_json(app_state(), HTTPStatus.CREATED)
+
+    def create_reply(self, payload: dict[str, Any]) -> None:
+        product_id = int(payload.get("product_id", 0))
+        question = payload.get("question", "").strip()
+        with connect() as conn:
+            product = get_product(conn, product_id)
+            if not product:
+                raise ValueError("商品不存在")
+            analysis = analyze_market(product, get_samples(conn, product_id))
+        self.send_json({"reply": generate_reply(product, question, analysis)})
+
+
+INDEX_HTML = r"""
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>闲鱼价差运营台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #202124;
+      --muted: #626a73;
+      --line: #d8dee4;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --accent: #0b6bcb;
+      --accent-2: #188038;
+      --warn: #b45309;
+      --bad: #b3261e;
+      --soft: #e8f0fe;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+      line-height: 1.5;
+    }
+    header {
+      background: #fff;
+      border-bottom: 1px solid var(--line);
+      padding: 18px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+    h1 { margin: 0; font-size: 22px; letter-spacing: 0; }
+    header p { margin: 4px 0 0; color: var(--muted); font-size: 14px; }
+    main {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      gap: 18px;
+      padding: 18px;
+      max-width: 1440px;
+      margin: 0 auto;
+    }
+    section, .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    h2, h3 { margin: 0 0 12px; font-size: 17px; letter-spacing: 0; }
+    h3 { font-size: 15px; }
+    label { display: block; color: var(--muted); font-size: 13px; margin: 10px 0 5px; }
+    input, textarea, select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 10px;
+      font: inherit;
+      background: #fff;
+    }
+    textarea { min-height: 90px; resize: vertical; }
+    button {
+      border: 0;
+      border-radius: 6px;
+      padding: 9px 12px;
+      font: inherit;
+      color: #fff;
+      background: var(--accent);
+      cursor: pointer;
+      min-height: 38px;
+    }
+    button.secondary { background: #4b5563; }
+    button.good { background: var(--accent-2); }
+    button:disabled { opacity: .6; cursor: wait; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .product-list { display: grid; gap: 10px; }
+    .product-tab {
+      text-align: left;
+      color: var(--ink);
+      background: #fff;
+      border: 1px solid var(--line);
+      display: block;
+      width: 100%;
+    }
+    .product-tab.active { border-color: var(--accent); background: var(--soft); }
+    .product-tab strong { display: block; font-size: 15px; }
+    .product-tab span { color: var(--muted); font-size: 13px; }
+    .workspace { display: grid; gap: 18px; }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      gap: 10px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      min-height: 74px;
+      background: #fbfcfd;
+    }
+    .metric span { display: block; color: var(--muted); font-size: 12px; }
+    .metric strong { display: block; margin-top: 5px; font-size: 20px; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 13px;
+      color: #134e4a;
+      background: #ccfbf1;
+      margin-right: 6px;
+    }
+    .badge.warn { color: #7c2d12; background: #ffedd5; }
+    .badge.bad { color: #7f1d1d; background: #fee2e2; }
+    .notice {
+      border-left: 4px solid var(--warn);
+      background: #fff7ed;
+      padding: 10px 12px;
+      margin: 8px 0;
+      color: #7c2d12;
+    }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin: 0;
+      padding: 12px;
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      min-height: 90px;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; }
+    .empty { color: var(--muted); padding: 24px; text-align: center; }
+    .search-link { color: var(--accent); text-decoration: none; font-size: 14px; }
+    @media (max-width: 980px) {
+      main, .grid2 { grid-template-columns: 1fr; }
+      .metrics { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>闲鱼价差运营台</h1>
+    <p>商品规划、行情采样、定价发布、接单后采购与缺货保护。</p>
+  </header>
+  <main>
+    <aside class="panel">
+      <h2>商品池</h2>
+      <form id="productForm">
+        <label>商品名称</label>
+        <input name="name" placeholder="例：某会员月卡 / 电影通兑票">
+        <label>类目</label>
+        <input name="category" placeholder="虚拟权益、卡券、服务">
+        <label>搜索关键词</label>
+        <input name="keywords" placeholder="多个关键词用空格或逗号分隔">
+        <div class="row">
+          <div>
+            <label>已知成本</label>
+            <input name="cost" type="number" step="0.01" value="0">
+          </div>
+          <div>
+            <label>最低利润</label>
+            <input name="min_profit" type="number" step="0.01" value="3">
+          </div>
+        </div>
+        <label>风险缓冲</label>
+        <input name="risk_buffer" type="number" step="0.01" value="1">
+        <label>库存模式</label>
+        <select name="stock_mode">
+          <option value="after_order">接单后采购</option>
+          <option value="in_stock">已有库存</option>
+        </select>
+        <label>备注</label>
+        <textarea name="notes" placeholder="使用范围、限制、售后规则"></textarea>
+        <div class="actions">
+          <button type="submit">添加商品</button>
+        </div>
+      </form>
+      <hr>
+      <div id="productList" class="product-list"></div>
+    </aside>
+
+    <div class="workspace" id="workspace">
+      <section class="empty">先添加一个商品，然后录入闲鱼搜索结果价格。</section>
+    </div>
+  </main>
+
+  <script>
+    let state = { products: [] };
+    let selectedId = null;
+
+    const $ = (selector, root = document) => root.querySelector(selector);
+    const money = (value) => Number(value || 0).toFixed(2).replace(/\.00$/, "").replace(/0$/, "");
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        headers: { "Content-Type": "application/json" },
+        ...options,
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "请求失败");
+      return data;
+    }
+
+    async function refresh() {
+      state = await api("/api/state");
+      if (!selectedId && state.products.length) selectedId = state.products[0].id;
+      if (selectedId && !state.products.some((p) => p.id === selectedId)) selectedId = state.products[0]?.id || null;
+      render();
+    }
+
+    function selectedProduct() {
+      return state.products.find((product) => product.id === selectedId);
+    }
+
+    function renderProductList() {
+      const list = $("#productList");
+      if (!state.products.length) {
+        list.innerHTML = '<div class="empty">还没有商品</div>';
+        return;
+      }
+      list.innerHTML = state.products.map((product) => `
+        <button class="product-tab ${product.id === selectedId ? "active" : ""}" data-id="${product.id}">
+          <strong>${escapeHtml(product.name)}</strong>
+          <span>${escapeHtml(product.category || "未分类")} · 建议价 ${money(product.analysis.suggested_price)} 元</span>
+        </button>
+      `).join("");
+      list.querySelectorAll("button").forEach((button) => {
+        button.addEventListener("click", () => {
+          selectedId = Number(button.dataset.id);
+          render();
+        });
+      });
+    }
+
+    function renderWorkspace() {
+      const product = selectedProduct();
+      const workspace = $("#workspace");
+      if (!product) {
+        workspace.innerHTML = '<section class="empty">先添加一个商品，然后录入闲鱼搜索结果价格。</section>';
+        return;
+      }
+      const a = product.analysis;
+      const draft = product.draft_preview;
+      const query = encodeURIComponent(product.keywords || product.name);
+      workspace.innerHTML = `
+        <section>
+          <h2>${escapeHtml(product.name)}</h2>
+          <p>
+            <span class="badge ${a.viable ? "" : "warn"}">${a.viable ? "可测试" : "需谨慎"}</span>
+            <span class="badge">样本 ${a.sample_count}</span>
+            <a class="search-link" href="https://www.goofish.com/search?q=${query}" target="_blank">打开闲鱼搜索</a>
+          </p>
+          <div class="metrics">
+            ${metric("最低价", a.min_price)}
+            ${metric("低价区间", a.q1_price)}
+            ${metric("中位数", a.median_price)}
+            ${metric("去极值均价", a.trimmed_avg)}
+            ${metric("建议售价", a.suggested_price)}
+          </div>
+          <p><strong>决策：</strong>${escapeHtml(a.decision)}</p>
+          <p><strong>采购上限：</strong>${money(a.max_purchase_price)} 元；<strong>预估利润：</strong>${money(a.expected_profit)} 元；<strong>加价策略：</strong>主流价 + ${money(a.recommended_markup)} 元。</p>
+          ${draft.warnings.map((warning) => `<div class="notice">${escapeHtml(warning)}</div>`).join("")}
+        </section>
+
+        <div class="grid2">
+          <section>
+            <h3>录入行情</h3>
+            <form id="sampleForm">
+              <label>批量粘贴搜索结果</label>
+              <textarea name="bulk_text" placeholder="例：某会员月卡 18元 有效期30天&#10;同类商品 ￥16.5 秒发"></textarea>
+              <div class="row">
+                <div>
+                  <label>单条标题</label>
+                  <input name="title" placeholder="可选">
+                </div>
+                <div>
+                  <label>单条价格</label>
+                  <input name="price" type="number" step="0.01" placeholder="可选">
+                </div>
+              </div>
+              <div class="actions">
+                <button type="submit">保存行情</button>
+              </div>
+            </form>
+          </section>
+
+          <section>
+            <h3>发布草稿</h3>
+            <p><strong>标题：</strong>${escapeHtml(draft.title)}</p>
+            <p><strong>价格：</strong>${money(draft.price)} 元</p>
+            <pre>${escapeHtml(draft.body)}</pre>
+            <div class="actions">
+              <button id="saveDraft" class="good">保存草稿</button>
+            </div>
+          </section>
+        </div>
+
+        <div class="grid2">
+          <section>
+            <h3>咨询回复</h3>
+            <form id="replyForm">
+              <label>买家问题</label>
+              <textarea name="question" placeholder="例：有货吗？能不能便宜？怎么用？"></textarea>
+              <div class="actions">
+                <button type="submit">生成回复</button>
+              </div>
+            </form>
+            <pre id="replyOutput"></pre>
+          </section>
+
+          <section>
+            <h3>接单履约</h3>
+            <form id="orderForm">
+              <label>买家备注</label>
+              <input name="buyer" placeholder="昵称或订单备注">
+              <label>成交价</label>
+              <input name="sale_price" type="number" step="0.01" value="${a.suggested_price}">
+              <div class="actions">
+                <button type="submit">判断货源</button>
+              </div>
+            </form>
+            <p class="notice">如果没有价格低于采购上限的候选货源，系统会生成缺货处理建议。</p>
+          </section>
+        </div>
+
+        <section>
+          <h3>行情样本</h3>
+          ${renderSamples(product.samples)}
+        </section>
+
+        <section>
+          <h3>订单记录</h3>
+          ${renderOrders(product.orders)}
+        </section>
+      `;
+      bindWorkspaceForms(product.id);
+    }
+
+    function metric(label, value) {
+      return `<div class="metric"><span>${label}</span><strong>${money(value)} 元</strong></div>`;
+    }
+
+    function renderSamples(samples) {
+      if (!samples.length) return '<div class="empty">还没有行情样本</div>';
+      return `
+        <table>
+          <thead><tr><th>价格</th><th>标题</th><th>备注</th></tr></thead>
+          <tbody>${samples.map((sample) => `
+            <tr><td>${money(sample.price)} 元</td><td>${escapeHtml(sample.title)}</td><td>${escapeHtml(sample.note || "")}</td></tr>
+          `).join("")}</tbody>
+        </table>
+      `;
+    }
+
+    function renderOrders(orders) {
+      if (!orders.length) return '<div class="empty">还没有订单</div>';
+      return `
+        <table>
+          <thead><tr><th>状态</th><th>成交价</th><th>采购上限</th><th>处理建议</th></tr></thead>
+          <tbody>${orders.map((order) => `
+            <tr>
+              <td><span class="badge ${order.status === "out_of_stock" ? "bad" : ""}">${escapeHtml(order.status)}</span></td>
+              <td>${money(order.sale_price)} 元</td>
+              <td>${money(order.max_purchase_price)} 元</td>
+              <td>${escapeHtml(order.reply)}</td>
+            </tr>
+          `).join("")}</tbody>
+        </table>
+      `;
+    }
+
+    function bindWorkspaceForms(productId) {
+      $("#sampleForm").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        await submitForm(event.currentTarget, "/api/market-samples", { product_id: productId });
+      });
+      $("#saveDraft").addEventListener("click", async () => {
+        await api("/api/drafts", { method: "POST", body: JSON.stringify({ product_id: productId }) });
+        await refresh();
+      });
+      $("#replyForm").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const form = event.currentTarget;
+        const payload = Object.fromEntries(new FormData(form).entries());
+        payload.product_id = productId;
+        const data = await api("/api/replies", { method: "POST", body: JSON.stringify(payload) });
+        $("#replyOutput").textContent = data.reply;
+      });
+      $("#orderForm").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        await submitForm(event.currentTarget, "/api/orders", { product_id: productId });
+      });
+    }
+
+    async function submitForm(form, path, extra = {}) {
+      const button = form.querySelector("button");
+      button.disabled = true;
+      try {
+        const payload = { ...Object.fromEntries(new FormData(form).entries()), ...extra };
+        state = await api(path, { method: "POST", body: JSON.stringify(payload) });
+        form.reset();
+        render();
+      } catch (error) {
+        alert(error.message);
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    function render() {
+      renderProductList();
+      renderWorkspace();
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    $("#productForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await submitForm(event.currentTarget, "/api/products");
+      selectedId = state.products[0]?.id || selectedId;
+      render();
+    });
+
+    refresh().catch((error) => {
+      $("#workspace").innerHTML = `<section class="empty">${escapeHtml(error.message)}</section>`;
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+def main() -> None:
+    init_db()
+    server = ThreadingHTTPServer((HOST, PORT), AppHandler)
+    print(f"闲鱼价差运营台已启动：http://{HOST}:{PORT}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
