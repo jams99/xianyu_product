@@ -64,7 +64,7 @@ python3 -m py_compile app.py
 
 `publish_queue`
 
-发布队列。后台自动选品后会把草稿放入这里，状态包括 `ready`、`filled`、`published`、`skipped`。
+发布队列。后台自动选品后会把草稿放入这里，状态包括 `ready`、`active`、`filled`、`published`、`skipped`。
 
 ## 当前主要能力
 
@@ -96,6 +96,8 @@ python3 -m py_compile app.py
 发布队列提供“复制填表”按钮，生成一段 bookmarklet 脚本。用户进入闲鱼发布编辑页后运行脚本，系统尝试填写标题、价格和描述。
 
 重要边界：脚本只填表，不点击最终发布。
+
+“开始发布队列”会调用 `/api/publish-queue/start`，优先继续 `active` 项，否则把最早的 `ready` 项标记为 `active`。前端会复制该商品的填表脚本并打开闲鱼入口页。由于浏览器跨域安全限制，本地后台不能直接把脚本注入闲鱼页面；用户仍需在发布编辑页运行已复制的脚本并人工确认发布。
 
 ### 行情采集辅助
 

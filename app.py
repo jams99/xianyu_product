@@ -409,7 +409,7 @@ def get_publish_queue(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         select pq.*, p.name as product_name, p.keywords
         from publish_queue pq
         join products p on p.id = pq.product_id
-        order by case pq.status when 'ready' then 0 when 'filled' then 1 else 2 end, pq.created_at desc
+        order by case pq.status when 'active' then 0 when 'ready' then 1 when 'filled' then 2 else 3 end, pq.created_at desc
         limit 30
         """
     ).fetchall()
@@ -490,6 +490,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.run_autopilot(payload)
             elif parsed.path == "/api/autopilot/cleanup-labor":
                 self.cleanup_labor_products()
+            elif parsed.path == "/api/publish-queue/start":
+                self.start_publish_queue()
             elif parsed.path == "/api/publish-queue/status":
                 self.update_publish_queue_status(payload)
             else:
@@ -896,7 +898,7 @@ class AppHandler(BaseHTTPRequestHandler):
     def update_publish_queue_status(self, payload: dict[str, Any]) -> None:
         queue_id = int(payload.get("queue_id", 0))
         status = payload.get("status", "").strip()
-        if status not in {"ready", "filled", "published", "skipped"}:
+        if status not in {"ready", "active", "filled", "published", "skipped"}:
             raise ValueError("发布队列状态不合法")
         with connect() as conn:
             conn.execute(
@@ -904,6 +906,48 @@ class AppHandler(BaseHTTPRequestHandler):
                 (status, now(), queue_id),
             )
         self.send_json(app_state())
+
+    def start_publish_queue(self) -> None:
+        with connect() as conn:
+            row = conn.execute(
+                """
+                select pq.*, p.name as product_name, p.keywords
+                from publish_queue pq
+                join products p on p.id = pq.product_id
+                where pq.status = 'active'
+                order by pq.updated_at desc
+                limit 1
+                """
+            ).fetchone()
+            if not row:
+                row = conn.execute(
+                    """
+                    select pq.*, p.name as product_name, p.keywords
+                    from publish_queue pq
+                    join products p on p.id = pq.product_id
+                    where pq.status = 'ready'
+                    order by pq.created_at asc
+                    limit 1
+                    """
+                ).fetchone()
+                if row:
+                    conn.execute(
+                        "update publish_queue set status = 'active', updated_at = ? where id = ?",
+                        (now(), row["id"]),
+                    )
+                    row = conn.execute(
+                        """
+                        select pq.*, p.name as product_name, p.keywords
+                        from publish_queue pq
+                        join products p on p.id = pq.product_id
+                        where pq.id = ?
+                        """,
+                        (row["id"],),
+                    ).fetchone()
+            item = dict(row) if row else None
+            if item:
+                item["warnings"] = json.loads(item["warnings"] or "[]")
+        self.send_json({"active_item": item, **app_state()})
 
 
 INDEX_HTML = r"""
@@ -1096,6 +1140,7 @@ INDEX_HTML = r"""
   <script>
     let state = { products: [] };
     let selectedId = null;
+    const goofishEntryUrl = "https://www.goofish.com";
 
     const $ = (selector, root = document) => root.querySelector(selector);
     const money = (value) => Number(value || 0).toFixed(2).replace(/\.00$/, "").replace(/0$/, "");
@@ -1293,14 +1338,19 @@ INDEX_HTML = r"""
       if (!queue.length) {
         return '<section><h2>发布队列</h2><div class="empty">还没有待发布商品。可以运行后台自动选品。</div></section>';
       }
+      const actionable = queue.some((item) => item.status === "active" || item.status === "ready");
       return `
         <section>
           <h2>发布队列</h2>
+          <div class="actions">
+            <button id="startPublishQueue" class="good" ${actionable ? "" : "disabled"}>开始发布队列</button>
+          </div>
+          <p class="helper-text">发布助手会锁定下一条待发布商品，复制填表脚本并打开闲鱼页面；你检查后手动发布。</p>
           <table>
             <thead><tr><th>状态</th><th>商品</th><th>价格</th><th>操作</th></tr></thead>
             <tbody>${queue.map((item) => `
               <tr>
-                <td><span class="badge ${item.status === "skipped" ? "bad" : ""}">${escapeHtml(item.status)}</span></td>
+                <td><span class="badge ${item.status === "skipped" ? "bad" : item.status === "active" ? "warn" : ""}">${escapeHtml(item.status)}</span></td>
                 <td>
                   <strong>${escapeHtml(item.product_name)}</strong><br>
                   <span class="helper-text">${escapeHtml(item.title)}</span>
@@ -1310,6 +1360,7 @@ INDEX_HTML = r"""
                   <div class="actions">
                     <button class="secondary copy-queue-publisher" data-product-id="${item.product_id}">复制填表</button>
                     <button class="good queue-status" data-id="${item.id}" data-status="filled">标记已填</button>
+                    <button class="good queue-status" data-id="${item.id}" data-status="published">标记已发布</button>
                     <button class="secondary queue-status" data-id="${item.id}" data-status="skipped">跳过</button>
                   </div>
                 </td>
@@ -1318,6 +1369,10 @@ INDEX_HTML = r"""
           </table>
         </section>
       `;
+    }
+
+    function publisherBookmarklet(productId) {
+      return `javascript:(()=>{fetch("http://127.0.0.1:8765/publisher.js?product_id=${productId}").then(r=>r.text()).then(code=>eval(code));})()`;
     }
 
     function bindWorkspaceForms(productId) {
@@ -1335,8 +1390,7 @@ INDEX_HTML = r"""
         await refresh();
       });
       $("#copyPublisher").addEventListener("click", async () => {
-        const script = `javascript:(()=>{fetch("http://127.0.0.1:8765/publisher.js?product_id=${productId}").then(r=>r.text()).then(code=>eval(code));})()`;
-        await navigator.clipboard.writeText(script);
+        await navigator.clipboard.writeText(publisherBookmarklet(productId));
         alert("填表脚本已复制。进入闲鱼发布编辑页后，把它粘贴到地址栏或保存成书签运行。");
       });
       $("#replyForm").addEventListener("submit", async (event) => {
@@ -1398,11 +1452,35 @@ INDEX_HTML = r"""
     });
 
     function bindQueueActions() {
+      const startButton = $("#startPublishQueue");
+      if (startButton) {
+        startButton.addEventListener("click", async () => {
+          const tab = window.open("about:blank", "_blank");
+          try {
+            const data = await api("/api/publish-queue/start", { method: "POST", body: "{}" });
+            state = data;
+            const item = data.active_item;
+            if (!item) {
+              if (tab) tab.close();
+              alert("发布队列里没有 ready 或 active 商品。");
+              render();
+              return;
+            }
+            selectedId = item.product_id;
+            await navigator.clipboard.writeText(publisherBookmarklet(item.product_id));
+            if (tab) tab.location.href = goofishEntryUrl;
+            alert(`正在处理：${item.product_name}。填表脚本已复制，进入闲鱼发布页后在地址栏运行脚本，检查无误后手动发布。`);
+            render();
+          } catch (error) {
+            if (tab) tab.close();
+            alert(error.message);
+          }
+        });
+      }
       document.querySelectorAll(".copy-queue-publisher").forEach((button) => {
         button.addEventListener("click", async () => {
           const productId = Number(button.dataset.productId);
-          const script = `javascript:(()=>{fetch("http://127.0.0.1:8765/publisher.js?product_id=${productId}").then(r=>r.text()).then(code=>eval(code));})()`;
-          await navigator.clipboard.writeText(script);
+          await navigator.clipboard.writeText(publisherBookmarklet(productId));
           alert("发布队列填表脚本已复制。进入闲鱼发布编辑页后运行，人工检查后再发布。");
         });
       });
