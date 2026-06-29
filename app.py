@@ -32,54 +32,56 @@ RISK_KEYWORDS = {
 
 AUTO_PRODUCT_CATALOG = [
     {
-        "name": "Excel公式问题整理服务",
-        "category": "无物流服务",
-        "keywords": "Excel 公式 表格 问题 解答",
-        "cost": 6,
-        "sample_prices": [9, 10, 12, 15, 18, 20],
-        "notes": "接单后确认问题范围，只承接合规表格整理和公式说明，不承诺复杂定制开发。",
+        "name": "视频会员月卡兑换权益",
+        "category": "无物流数字权益",
+        "keywords": "视频会员 月卡 兑换 权益",
+        "cost": 11,
+        "sample_prices": [13, 15, 16, 18, 20, 22],
+        "notes": "接单后只采购可转让、可验证的兑换权益；确认有效期和适用平台后再交付。",
     },
     {
-        "name": "PPT排版美化建议服务",
-        "category": "无物流服务",
-        "keywords": "PPT 排版 美化 建议",
+        "name": "音乐会员月卡兑换权益",
+        "category": "无物流数字权益",
+        "keywords": "音乐会员 月卡 兑换 权益",
         "cost": 8,
-        "sample_prices": [12, 15, 18, 20, 25, 28],
-        "notes": "接单前确认页数和交付范围，避免涉及版权素材或代写敏感内容。",
+        "sample_prices": [10, 12, 13, 15, 18, 20],
+        "notes": "接单后确认平台、有效期和是否可转让，采购低价兑换权益后交付。",
     },
     {
-        "name": "简历排版优化建议",
-        "category": "无物流服务",
-        "keywords": "简历 排版 优化 建议",
+        "name": "网盘会员月卡兑换权益",
+        "category": "无物流数字权益",
+        "keywords": "网盘会员 月卡 兑换 权益",
+        "cost": 9,
+        "sample_prices": [11, 13, 15, 16, 19, 22],
+        "notes": "接单后确认账号类型、有效期和使用限制，只交付可验证的兑换权益。",
+    },
+    {
+        "name": "咖啡代金券兑换权益",
+        "category": "无物流数字权益",
+        "keywords": "咖啡 代金券 兑换券 权益",
         "cost": 7,
-        "sample_prices": [10, 12, 15, 18, 20, 25],
-        "notes": "只做排版和表达建议，不伪造经历、证书或背调信息。",
+        "sample_prices": [9, 10, 12, 13, 15, 18],
+        "notes": "接单后确认门店、有效期和可转让性，只采购可正常核销的兑换权益。",
     },
     {
-        "name": "Notion模板搭建指导",
-        "category": "无物流服务",
-        "keywords": "Notion 模板 搭建 指导",
-        "cost": 6,
-        "sample_prices": [10, 12, 15, 18, 22, 25],
-        "notes": "接单后按需求提供模板搭建指导，确认模板来源可用且不侵权。",
-    },
-    {
-        "name": "电子资料目录整理服务",
-        "category": "无物流服务",
-        "keywords": "资料 整理 目录 分类",
+        "name": "外卖代金券兑换权益",
+        "category": "无物流数字权益",
+        "keywords": "外卖 代金券 红包 兑换 权益",
         "cost": 5,
-        "sample_prices": [8, 9, 12, 15, 18, 20],
-        "notes": "只承接用户自有资料的目录整理，不售卖来源不明资料包。",
+        "sample_prices": [7, 8, 9, 11, 13, 15],
+        "notes": "接单后确认平台、城市、有效期和使用门槛，只采购可转让可核销权益。",
     },
     {
-        "name": "AI提示词整理服务",
-        "category": "无物流服务",
-        "keywords": "AI 提示词 prompt 整理",
-        "cost": 5,
-        "sample_prices": [8, 10, 12, 15, 18, 22],
-        "notes": "根据用户场景整理提示词模板，不承诺绕过平台限制或生成违规内容。",
+        "name": "游戏点卡小额兑换权益",
+        "category": "无物流数字权益",
+        "keywords": "游戏点卡 小额 兑换 权益",
+        "cost": 8,
+        "sample_prices": [10, 12, 13, 15, 17, 20],
+        "notes": "接单后确认游戏区服、面额和兑换限制，只采购来源清晰的可转让权益。",
     },
 ]
+
+AUTO_BLOCKED_KEYWORDS = {"电影票", "演唱会", "票务"}
 
 
 def connect() -> sqlite3.Connection:
@@ -332,9 +334,9 @@ def make_publish_draft(product: dict[str, Any], analysis: MarketAnalysis) -> dic
 
     body_lines = [
         f"商品：{name}",
-        "适合不需要快递的虚拟权益/服务类需求。",
+        "适合不需要快递的虚拟权益/数字兑换类需求。",
         "下单前请先咨询，确认可用范围、有效期和当前可安排情况。",
-        "确认后再安排采购与交付；如暂时没有合适货源，会及时说明缺货并不强行成交。",
+        "确认后再安排低价货源采购与交付；如暂时没有合适货源，会及时说明缺货并不强行成交。",
         "不支持来源不明、违规用途或超出规则范围的使用方式。",
     ]
     if product["notes"].strip():
@@ -550,6 +552,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.create_product_from_opportunity(payload)
             elif parsed.path == "/api/autopilot/run":
                 self.run_autopilot(payload)
+            elif parsed.path == "/api/autopilot/cleanup-labor":
+                self.cleanup_labor_products()
             elif parsed.path == "/api/publish-queue/status":
                 self.update_publish_queue_status(payload)
             else:
@@ -981,8 +985,8 @@ class AppHandler(BaseHTTPRequestHandler):
         for item in AUTO_PRODUCT_CATALOG:
             analysis, product, samples = catalog_item_analysis(item, min_profit, risk_buffer)
             catalog_text = f"{item['name']} {item['category']} {item['keywords']} {item['notes']}"
-            has_catalog_risk = any(keyword in catalog_text for keyword in RISK_KEYWORDS)
-            if analysis.viable and not has_catalog_risk:
+            is_blocked = any(keyword in catalog_text for keyword in AUTO_BLOCKED_KEYWORDS)
+            if analysis.viable and not is_blocked:
                 score = analysis.expected_profit + (analysis.sample_count * 0.2) - (analysis.suggested_price * 0.03)
                 candidates.append((score, item, product, samples, analysis))
         candidates.sort(key=lambda entry: entry[0], reverse=True)
@@ -1085,6 +1089,21 @@ class AppHandler(BaseHTTPRequestHandler):
                 existing_names.add(product["name"])
                 created += 1
         self.send_json({"created": created, **app_state()}, HTTPStatus.CREATED)
+
+    def cleanup_labor_products(self) -> None:
+        with connect() as conn:
+            product_ids = [
+                row["id"]
+                for row in conn.execute("select id from products where category = '无物流服务'").fetchall()
+            ]
+            if product_ids:
+                placeholders = ",".join("?" for _ in product_ids)
+                conn.execute(f"delete from publish_queue where product_id in ({placeholders})", product_ids)
+                conn.execute(f"delete from drafts where product_id in ({placeholders})", product_ids)
+                conn.execute(f"delete from orders where product_id in ({placeholders})", product_ids)
+                conn.execute(f"delete from market_samples where product_id in ({placeholders})", product_ids)
+                conn.execute(f"delete from products where id in ({placeholders})", product_ids)
+        self.send_json({"removed": len(product_ids), **app_state()})
 
     def update_publish_queue_status(self, payload: dict[str, Any]) -> None:
         queue_id = int(payload.get("queue_id", 0))
@@ -1315,8 +1334,9 @@ INDEX_HTML = r"""
         <input name="risk_buffer" type="number" step="0.01" value="1">
         <div class="actions">
           <button type="submit" class="good">自动选品入队</button>
+          <button type="button" id="cleanupLabor" class="secondary">清理服务类候选</button>
         </div>
-        <p class="helper-text">系统会从内置低风险无物流候选池里选择商品，生成草稿并加入发布队列。</p>
+        <p class="helper-text">系统会从无需人力服务的数字权益候选池里选择商品，生成草稿并加入发布队列。</p>
       </form>
       <hr>
       <h2>机会扫描</h2>
@@ -1684,6 +1704,13 @@ INDEX_HTML = r"""
       await submitForm(event.currentTarget, "/api/autopilot/run");
       selectedId = state.products[0]?.id || selectedId;
       render();
+    });
+
+    $("#cleanupLabor").addEventListener("click", async () => {
+      state = await api("/api/autopilot/cleanup-labor", { method: "POST", body: "{}" });
+      selectedId = state.products[0]?.id || null;
+      render();
+      alert(`已清理 ${state.removed || 0} 个服务类候选。`);
     });
 
     function bindQueueActions() {
