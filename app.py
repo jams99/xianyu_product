@@ -348,12 +348,19 @@ def app_state() -> dict[str, Any]:
 class AppHandler(BaseHTTPRequestHandler):
     server_version = "XianyuAgent/0.1"
 
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_cors_headers()
+        self.end_headers()
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/":
             self.send_html(INDEX_HTML)
         elif parsed.path == "/api/state":
             self.send_json(app_state())
+        elif parsed.path == "/collector.js":
+            self.send_js(self.collector_script(parsed))
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -388,6 +395,7 @@ class AppHandler(BaseHTTPRequestHandler):
     def send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         encoded = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
+        self.send_cors_headers()
         self.send_header("content-type", "application/json; charset=utf-8")
         self.send_header("content-length", str(len(encoded)))
         self.end_headers()
@@ -396,10 +404,70 @@ class AppHandler(BaseHTTPRequestHandler):
     def send_html(self, html: str) -> None:
         encoded = html.encode("utf-8")
         self.send_response(HTTPStatus.OK)
+        self.send_cors_headers()
         self.send_header("content-type", "text/html; charset=utf-8")
         self.send_header("content-length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    def send_js(self, script: str) -> None:
+        encoded = script.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_cors_headers()
+        self.send_header("content-type", "application/javascript; charset=utf-8")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def send_cors_headers(self) -> None:
+        self.send_header("access-control-allow-origin", "*")
+        self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
+        self.send_header("access-control-allow-headers", "content-type")
+
+    def collector_script(self, parsed: urllib.parse.ParseResult) -> str:
+        query = urllib.parse.parse_qs(parsed.query)
+        product_id = int((query.get("product_id") or ["0"])[0])
+        return f"""
+(async () => {{
+  const productId = {product_id};
+  if (!productId) {{
+    alert("缺少 product_id，无法导入行情。");
+    return;
+  }}
+  const lines = document.body.innerText
+    .split(/\\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const priceLines = [];
+  for (let index = 0; index < lines.length; index += 1) {{
+    const line = lines[index];
+    if (/(?:¥|￥)?\\s*\\d+(?:\\.\\d{{1,2}})?\\s*(?:元)?/.test(line)) {{
+      const previous = lines[index - 1] || "";
+      const next = lines[index + 1] || "";
+      priceLines.push([previous, line, next].filter(Boolean).join(" "));
+    }}
+  }}
+  if (!priceLines.length) {{
+    alert("没有识别到价格。请先确认搜索结果已加载，或手动复制页面文本到后台。");
+    return;
+  }}
+  const response = await fetch("http://127.0.0.1:{PORT}/api/market-samples", {{
+    method: "POST",
+    headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify({{
+      product_id: productId,
+      bulk_text: priceLines.slice(0, 80).join("\\n"),
+      source: location.href
+    }})
+  }});
+  if (!response.ok) {{
+    const data = await response.json().catch(() => ({{}}));
+    alert(data.error || "导入失败，请回到本地后台查看。");
+    return;
+  }}
+  alert(`已导入 ${{priceLines.length}} 条候选价格，请回到本地后台查看。`);
+}})();
+"""
 
     def create_product(self, payload: dict[str, Any]) -> None:
         name = payload.get("name", "").strip()
@@ -676,6 +744,7 @@ INDEX_HTML = r"""
     th { color: var(--muted); font-weight: 600; }
     .empty { color: var(--muted); padding: 24px; text-align: center; }
     .search-link { color: var(--accent); text-decoration: none; font-size: 14px; }
+    .helper-text { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
     @media (max-width: 980px) {
       main, .grid2 { grid-template-columns: 1fr; }
       .metrics { grid-template-columns: repeat(2, 1fr); }
@@ -795,6 +864,10 @@ INDEX_HTML = r"""
             <span class="badge">样本 ${a.sample_count}</span>
             <a class="search-link" href="https://www.goofish.com/search?q=${query}" target="_blank">打开闲鱼搜索</a>
           </p>
+          <div class="actions">
+            <button id="copyCollector" class="secondary">复制采样脚本</button>
+          </div>
+          <p class="helper-text">先打开搜索页，等结果加载后运行采样脚本；脚本只读取当前页面文字并导入价格样本。</p>
           <div class="metrics">
             ${metric("最低价", a.min_price)}
             ${metric("低价区间", a.q1_price)}
@@ -918,6 +991,11 @@ INDEX_HTML = r"""
       $("#sampleForm").addEventListener("submit", async (event) => {
         event.preventDefault();
         await submitForm(event.currentTarget, "/api/market-samples", { product_id: productId });
+      });
+      $("#copyCollector").addEventListener("click", async () => {
+        const script = `javascript:(()=>{fetch("http://127.0.0.1:8765/collector.js?product_id=${productId}").then(r=>r.text()).then(code=>eval(code));})()`;
+        await navigator.clipboard.writeText(script);
+        alert("采样脚本已复制。打开闲鱼搜索页后，把它粘贴到地址栏或保存成书签运行。");
       });
       $("#saveDraft").addEventListener("click", async () => {
         await api("/api/drafts", { method: "POST", body: JSON.stringify({ product_id: productId }) });
