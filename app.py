@@ -30,6 +30,58 @@ RISK_KEYWORDS = {
 }
 
 
+AUTO_PRODUCT_CATALOG = [
+    {
+        "name": "Excel公式问题整理服务",
+        "category": "无物流服务",
+        "keywords": "Excel 公式 表格 问题 解答",
+        "cost": 6,
+        "sample_prices": [9, 10, 12, 15, 18, 20],
+        "notes": "接单后确认问题范围，只承接合规表格整理和公式说明，不承诺复杂定制开发。",
+    },
+    {
+        "name": "PPT排版美化建议服务",
+        "category": "无物流服务",
+        "keywords": "PPT 排版 美化 建议",
+        "cost": 8,
+        "sample_prices": [12, 15, 18, 20, 25, 28],
+        "notes": "接单前确认页数和交付范围，避免涉及版权素材或代写敏感内容。",
+    },
+    {
+        "name": "简历排版优化建议",
+        "category": "无物流服务",
+        "keywords": "简历 排版 优化 建议",
+        "cost": 7,
+        "sample_prices": [10, 12, 15, 18, 20, 25],
+        "notes": "只做排版和表达建议，不伪造经历、证书或背调信息。",
+    },
+    {
+        "name": "Notion模板搭建指导",
+        "category": "无物流服务",
+        "keywords": "Notion 模板 搭建 指导",
+        "cost": 6,
+        "sample_prices": [10, 12, 15, 18, 22, 25],
+        "notes": "接单后按需求提供模板搭建指导，确认模板来源可用且不侵权。",
+    },
+    {
+        "name": "电子资料目录整理服务",
+        "category": "无物流服务",
+        "keywords": "资料 整理 目录 分类",
+        "cost": 5,
+        "sample_prices": [8, 9, 12, 15, 18, 20],
+        "notes": "只承接用户自有资料的目录整理，不售卖来源不明资料包。",
+    },
+    {
+        "name": "AI提示词整理服务",
+        "category": "无物流服务",
+        "keywords": "AI 提示词 prompt 整理",
+        "cost": 5,
+        "sample_prices": [8, 10, 12, 15, 18, 22],
+        "notes": "根据用户场景整理提示词模板，不承诺绕过平台限制或生成违规内容。",
+    },
+]
+
+
 def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -105,6 +157,19 @@ def init_db() -> None:
                 viable integer not null default 0,
                 decision text not null default '',
                 created_at integer not null
+            );
+
+            create table if not exists publish_queue (
+                id integer primary key autoincrement,
+                product_id integer not null references products(id) on delete cascade,
+                title text not null,
+                price real not null,
+                body text not null,
+                status text not null default 'ready',
+                source text not null default 'autopilot',
+                warnings text not null default '[]',
+                created_at integer not null,
+                updated_at integer not null
             );
             """
         )
@@ -303,6 +368,28 @@ def generate_reply(product: dict[str, Any], question: str, analysis: MarketAnaly
     return f"收到，我先按 {name} 帮你确认。为了避免无效交付，请补充一下使用范围、期望价格和是否急用；如果没有合适低价货源，我会直接回复缺货。"
 
 
+def catalog_item_analysis(item: dict[str, Any], min_profit: float, risk_buffer: float) -> tuple[MarketAnalysis, dict[str, Any], list[dict[str, Any]]]:
+    product = {
+        "name": item["name"],
+        "category": item["category"],
+        "keywords": item["keywords"],
+        "cost": item["cost"],
+        "min_profit": min_profit,
+        "risk_buffer": risk_buffer,
+        "stock_mode": "after_order",
+        "notes": item["notes"],
+    }
+    samples = [
+        {
+            "title": item["name"],
+            "price": float(price),
+            "note": f"自动候选参考价：{item['name']} {money(float(price))}元",
+        }
+        for price in item["sample_prices"]
+    ]
+    return analyze_market(product, samples), product, samples
+
+
 def parse_price_lines(text: str) -> list[dict[str, Any]]:
     samples: list[dict[str, Any]] = []
     for raw_line in text.splitlines():
@@ -371,6 +458,22 @@ def get_opportunities(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return opportunities
 
 
+def get_publish_queue(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        select pq.*, p.name as product_name, p.keywords
+        from publish_queue pq
+        join products p on p.id = pq.product_id
+        order by case pq.status when 'ready' then 0 when 'filled' then 1 else 2 end, pq.created_at desc
+        limit 30
+        """
+    ).fetchall()
+    queue = rows_to_dicts(rows)
+    for item in queue:
+        item["warnings"] = json.loads(item["warnings"] or "[]")
+    return queue
+
+
 def app_state() -> dict[str, Any]:
     with connect() as conn:
         products = rows_to_dicts(conn.execute("select * from products order by created_at desc").fetchall())
@@ -399,7 +502,11 @@ def app_state() -> dict[str, Any]:
                     "orders": orders,
                 }
             )
-        return {"products": enriched, "opportunities": get_opportunities(conn)}
+        return {
+            "products": enriched,
+            "opportunities": get_opportunities(conn),
+            "publish_queue": get_publish_queue(conn),
+        }
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -441,6 +548,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.create_opportunities(payload)
             elif parsed.path == "/api/products/from-opportunity":
                 self.create_product_from_opportunity(payload)
+            elif parsed.path == "/api/autopilot/run":
+                self.run_autopilot(payload)
+            elif parsed.path == "/api/publish-queue/status":
+                self.update_publish_queue_status(payload)
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
         except ValueError as exc:
@@ -862,6 +973,131 @@ class AppHandler(BaseHTTPRequestHandler):
             )
         self.send_json(app_state(), HTTPStatus.CREATED)
 
+    def run_autopilot(self, payload: dict[str, Any]) -> None:
+        max_items = max(1, min(6, int(clean_float(payload.get("max_items"), 3))))
+        min_profit = clean_float(payload.get("min_profit"), 3)
+        risk_buffer = clean_float(payload.get("risk_buffer"), 1)
+        candidates: list[tuple[float, dict[str, Any], dict[str, Any], list[dict[str, Any]], MarketAnalysis]] = []
+        for item in AUTO_PRODUCT_CATALOG:
+            analysis, product, samples = catalog_item_analysis(item, min_profit, risk_buffer)
+            catalog_text = f"{item['name']} {item['category']} {item['keywords']} {item['notes']}"
+            has_catalog_risk = any(keyword in catalog_text for keyword in RISK_KEYWORDS)
+            if analysis.viable and not has_catalog_risk:
+                score = analysis.expected_profit + (analysis.sample_count * 0.2) - (analysis.suggested_price * 0.03)
+                candidates.append((score, item, product, samples, analysis))
+        candidates.sort(key=lambda entry: entry[0], reverse=True)
+
+        created = 0
+        with connect() as conn:
+            existing_names = {
+                row["name"]
+                for row in conn.execute("select name from products").fetchall()
+            }
+            for _score, item, product, samples, analysis in candidates:
+                if created >= max_items:
+                    break
+                if product["name"] in existing_names:
+                    continue
+                cursor = conn.execute(
+                    """
+                    insert into products (name, category, keywords, cost, min_profit, risk_buffer, stock_mode, notes, created_at)
+                    values (?, ?, ?, ?, ?, ?, 'after_order', ?, ?)
+                    """,
+                    (
+                        product["name"],
+                        product["category"],
+                        product["keywords"],
+                        product["cost"],
+                        product["min_profit"],
+                        product["risk_buffer"],
+                        product["notes"],
+                        now(),
+                    ),
+                )
+                product_id = cursor.lastrowid
+                conn.executemany(
+                    """
+                    insert into market_samples (product_id, title, price, source, seller, note, created_at)
+                    values (?, ?, ?, '后台自动选品', '', ?, ?)
+                    """,
+                    [
+                        (product_id, sample["title"], sample["price"], sample["note"], now())
+                        for sample in samples
+                    ],
+                )
+                draft = make_publish_draft(product, analysis)
+                conn.execute(
+                    """
+                    insert into drafts (product_id, title, price, body, warnings, decision, created_at)
+                    values (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        product_id,
+                        draft["title"],
+                        draft["price"],
+                        draft["body"],
+                        json.dumps(draft["warnings"], ensure_ascii=False),
+                        draft["decision"],
+                        now(),
+                    ),
+                )
+                conn.execute(
+                    """
+                    insert into publish_queue (product_id, title, price, body, status, source, warnings, created_at, updated_at)
+                    values (?, ?, ?, ?, 'ready', 'autopilot', ?, ?, ?)
+                    """,
+                    (
+                        product_id,
+                        draft["title"],
+                        draft["price"],
+                        draft["body"],
+                        json.dumps(draft["warnings"], ensure_ascii=False),
+                        now(),
+                        now(),
+                    ),
+                )
+                conn.execute(
+                    """
+                    insert into opportunities (
+                        keyword, category, cost, min_profit, risk_buffer, sample_prices, sample_count,
+                        min_price, median_price, suggested_price, max_purchase_price,
+                        expected_profit, viable, decision, created_at
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        item["keywords"],
+                        item["category"],
+                        item["cost"],
+                        min_profit,
+                        risk_buffer,
+                        json.dumps(item["sample_prices"], ensure_ascii=False),
+                        len(item["sample_prices"]),
+                        analysis.min_price,
+                        analysis.median_price,
+                        analysis.suggested_price,
+                        analysis.max_purchase_price,
+                        analysis.expected_profit,
+                        analysis.decision,
+                        now(),
+                    ),
+                )
+                existing_names.add(product["name"])
+                created += 1
+        self.send_json({"created": created, **app_state()}, HTTPStatus.CREATED)
+
+    def update_publish_queue_status(self, payload: dict[str, Any]) -> None:
+        queue_id = int(payload.get("queue_id", 0))
+        status = payload.get("status", "").strip()
+        if status not in {"ready", "filled", "published", "skipped"}:
+            raise ValueError("发布队列状态不合法")
+        with connect() as conn:
+            conn.execute(
+                "update publish_queue set status = ?, updated_at = ? where id = ?",
+                (status, now(), queue_id),
+            )
+        self.send_json(app_state())
+
 
 INDEX_HTML = r"""
 <!doctype html>
@@ -1063,6 +1299,26 @@ INDEX_HTML = r"""
       <hr>
       <div id="productList" class="product-list"></div>
       <hr>
+      <h2>后台自动选品</h2>
+      <form id="autopilotForm">
+        <div class="row">
+          <div>
+            <label>本次选品数</label>
+            <input name="max_items" type="number" min="1" max="6" value="3">
+          </div>
+          <div>
+            <label>最低利润</label>
+            <input name="min_profit" type="number" step="0.01" value="3">
+          </div>
+        </div>
+        <label>风险缓冲</label>
+        <input name="risk_buffer" type="number" step="0.01" value="1">
+        <div class="actions">
+          <button type="submit" class="good">自动选品入队</button>
+        </div>
+        <p class="helper-text">系统会从内置低风险无物流候选池里选择商品，生成草稿并加入发布队列。</p>
+      </form>
+      <hr>
       <h2>机会扫描</h2>
       <form id="opportunityForm">
         <label>类目</label>
@@ -1171,14 +1427,16 @@ INDEX_HTML = r"""
     function renderWorkspace() {
       const product = selectedProduct();
       const workspace = $("#workspace");
+      const queueHtml = renderPublishQueue(state.publish_queue || []);
       if (!product) {
-        workspace.innerHTML = '<section class="empty">先添加一个商品，然后录入闲鱼搜索结果价格。</section>';
+        workspace.innerHTML = `${queueHtml}<section class="empty">可以先运行后台自动选品，或手动添加一个商品。</section>`;
         return;
       }
       const a = product.analysis;
       const draft = product.draft_preview;
       const query = encodeURIComponent(product.keywords || product.name);
       workspace.innerHTML = `
+        ${queueHtml}
         <section>
           <h2>${escapeHtml(product.name)}</h2>
           <p>
@@ -1314,6 +1572,37 @@ INDEX_HTML = r"""
       `;
     }
 
+    function renderPublishQueue(queue) {
+      if (!queue.length) {
+        return '<section><h2>发布队列</h2><div class="empty">还没有待发布商品。可以运行后台自动选品。</div></section>';
+      }
+      return `
+        <section>
+          <h2>发布队列</h2>
+          <table>
+            <thead><tr><th>状态</th><th>商品</th><th>价格</th><th>操作</th></tr></thead>
+            <tbody>${queue.map((item) => `
+              <tr>
+                <td><span class="badge ${item.status === "skipped" ? "bad" : ""}">${escapeHtml(item.status)}</span></td>
+                <td>
+                  <strong>${escapeHtml(item.product_name)}</strong><br>
+                  <span class="helper-text">${escapeHtml(item.title)}</span>
+                </td>
+                <td>${money(item.price)} 元</td>
+                <td>
+                  <div class="actions">
+                    <button class="secondary copy-queue-publisher" data-product-id="${item.product_id}">复制填表</button>
+                    <button class="good queue-status" data-id="${item.id}" data-status="filled">标记已填</button>
+                    <button class="secondary queue-status" data-id="${item.id}" data-status="skipped">跳过</button>
+                  </div>
+                </td>
+              </tr>
+            `).join("")}</tbody>
+          </table>
+        </section>
+      `;
+    }
+
     function bindWorkspaceForms(productId) {
       $("#sampleForm").addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -1366,6 +1655,7 @@ INDEX_HTML = r"""
       renderProductList();
       renderOpportunityList();
       renderWorkspace();
+      bindQueueActions();
     }
 
     function escapeHtml(value) {
@@ -1388,6 +1678,33 @@ INDEX_HTML = r"""
       event.preventDefault();
       await submitForm(event.currentTarget, "/api/opportunities");
     });
+
+    $("#autopilotForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await submitForm(event.currentTarget, "/api/autopilot/run");
+      selectedId = state.products[0]?.id || selectedId;
+      render();
+    });
+
+    function bindQueueActions() {
+      document.querySelectorAll(".copy-queue-publisher").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const productId = Number(button.dataset.productId);
+          const script = `javascript:(()=>{fetch("http://127.0.0.1:8765/publisher.js?product_id=${productId}").then(r=>r.text()).then(code=>eval(code));})()`;
+          await navigator.clipboard.writeText(script);
+          alert("发布队列填表脚本已复制。进入闲鱼发布编辑页后运行，人工检查后再发布。");
+        });
+      });
+      document.querySelectorAll(".queue-status").forEach((button) => {
+        button.addEventListener("click", async () => {
+          state = await api("/api/publish-queue/status", {
+            method: "POST",
+            body: JSON.stringify({ queue_id: Number(button.dataset.id), status: button.dataset.status }),
+          });
+          render();
+        });
+      });
+    }
 
     refresh().catch((error) => {
       $("#workspace").innerHTML = `<section class="empty">${escapeHtml(error.message)}</section>`;
